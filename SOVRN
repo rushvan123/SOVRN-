@@ -313,3 +313,119 @@ bash
 
 curl -X POST http://localhost:8000/anomalies/resolve \ -H "Authorization: Bearer <your_jwt_token>" \ -H "Content-Type: application/json" \ -d '{ "anomaly_id": "<anomaly_id>", "resolution_details": "Verified via KYC" }'
 
+
+
+
+
+
+
+
+
+SAFE HARBOR-------------
+
+
+
+
+
+import asyncio import json from decimal import Decimal from typing import List, Optional from sqlalchemy import Column, String, Boolean, Numeric, DateTime from sqlalchemy.ext.asyncio import AsyncSession from pydantic import BaseModel, Field from fastapi import FastAPI, HTTPException, Depends from scipy import stats import numpy as np from sklearn.ensemble import IsolationForest from celery import Celery import redis import aiosmtplib from email.message import EmailMessage from web3 import Web3 from chainlink import ChainlinkClient from zkproof import ZKProof # Hypothetical ZKP library from .sovrn_dex_patch import ( Base, db_manager, asset_token_service, dex_engine, cross_border_engine, User, KYCStatus, Transaction, TRANSACTION_COUNTER, apply_patch ) from .sovrn_dex import logger, RateLimiter, get_current_user # Configuration class SHTConfig: ENABLE_SHT = os.getenv('ENABLE_SHT', 'false').lower() == 'true' ENABLE_QCBPO = os.getenv('ENABLE_QCBPO', 'false').lower() == 'true' ENABLE_ANOMALY_DETECTION = os.getenv('ENABLE_ANOMALY_DETECTION', 'false').lower() == 'true' ZSCORE_THRESHOLD = float(os.getenv('ZSCORE_THRESHOLD', '3.0')) IQR_MULTIPLIER = float(os.getenv('IQR_MULTIPLIER', '1.5')) GRUBBS_ALPHA = float(os.getenv('GRUBBS_ALPHA', '0.05')) CHAUVENET_THRESHOLD = float(os.getenv('CHAUVENET_THRESHOLD', '0.5')) PEIRCE_THRESHOLD = float(os.getenv('PEIRCE_THRESHOLD', '1.0')) MIN_DATA_POINTS = int(os.getenv('MIN_DATA_POINTS', '10')) FALLBACK_AVERAGE = Decimal(os.getenv('FALLBACK_AVERAGE', '1000')) SMTP_HOST = os.getenv('SMTP_HOST', 'smtp.gmail.com') SMTP_PORT = int(os.getenv('SMTP_PORT', '587')) SMTP_USER = os.getenv('SMTP_USER', '') SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '') REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0') CHAINLINK_NODE_URL = os.getenv('CHAINLINK_NODE_URL', '') CHAINLINK_SUBSCRIPTION_ID = os.getenv('CHAINLINK_SUBSCRIPTION_ID', '') QUANTUM_KEY = os.getenv('QUANTUM_KEY', '') NEVIS_TRUST_ADDRESS = os.getenv('NEVIS_TRUST_ADDRESS', '0xnevis_trust') COOK_ISLANDS_TRUST_ADDRESS = os.getenv('COOK_ISLANDS_TRUST_ADDRESS', '0xcook_islands_trust') sht_config = SHTConfig() # Celery Setup celery = Celery('sovrn_sht', broker=sht_config.REDIS_URL, backend=sht_config.REDIS_URL) # Redis Cache redis_client = redis.Redis.from_url(sht_config.REDIS_URL, decode_responses=True) # Database Models class AnomalyRecord(Base): __tablename__ = "anomaly_records" id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4) transaction_id = Column(UUID(as_uuid=True), nullable=True) user_id = Column(UUID(as_uuid=True), nullable=False) asset_address = Column(String, nullable=True) anomaly_type = Column(String, nullable=False) value = Column(Numeric, nullable=False) threshold = Column(Numeric, nullable=False) is_resolved = Column(Boolean, default=False) created_at = Column(DateTime, default=datetime.utcnow) class QCBPORecord(Base): __tablename__ = "qcbpo_records" id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4) user_id = Column(UUID(as_uuid=True), nullable=False) payment_id = Column(UUID(as_uuid=True), nullable=False) rail = Column(String, nullable=False) amount = Column(Numeric, nullable=False) asset_address = Column(String, nullable=True) compliance_status = Column(String, default="pending") chainlink_request_id = Column(String, nullable=True) created_at = Column(DateTime, default=datetime.utcnow) class SHTRecord(Base): __tablename__ = "sht_records" id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4) user_id = Column(UUID(as_uuid=True), nullable=False) trust_id = Column(UUID(as_uuid=True), nullable=False) jurisdiction = Column(String, nullable=False) # Nevis, Cook Islands trustee_address = Column(String, nullable=False) beneficiary_address = Column(String, nullable=False) asset_address = Column(String, nullable=True) amount = Column(Numeric, nullable=False) zkp_hash = Column(String, nullable=True) compliance_status = Column(String, default="pending") created_at = Column(DateTime, default=datetime.utcnow) # Pydantic Models class AnomalyReport(BaseModel): transaction_id: Optional[str] user_id: str asset_address: Optional[str] anomaly_type: str value: Decimal threshold: Decimal status: str class AnomalyResolveRequest(BaseModel): anomaly_id: str resolution_details: str = Field(..., max_length=500) class QCBPOPaymentRequest(BaseModel): user_id: str from_currency: str to_currency: str amount: Decimal asset_address: Optional[str] destination: str preferred_rail: Optional[str] class QCBPOPaymentResponse(BaseModel): payment_id: str rail: str amount: Decimal asset_address: Optional[str] compliance_status: str chainlink_request_id: Optional[str] estimated_savings: Decimal class SHTrustRequest(BaseModel): user_id: str jurisdiction: str # Nevis, Cook Islands trustee_address: str # Non-U.S. trustee beneficiary_address: str asset_address: Optional[str] amount: Decimal class SHTrustResponse(BaseModel): trust_id: str jurisdiction: str trustee_address: str beneficiary_address: str asset_address: Optional[str] amount: Decimal compliance_status: str zkp_hash: Optional[str] # Smart Contract (Simplified) SHT_CONTRACT_ABI = [ { "function": "createTrust", "inputs": [ {"name": "jurisdiction", "type": "string"}, {"name": "trustee", "type": "address"}, {"name": "beneficiary", "type": "address"}, {"name": "asset", "type": "address"}, {"name": "amount", "type": "uint256"} ], "outputs": [{"name": "trustId", "type": "bytes32"}] }, { "function": "transferAsset", "inputs": [ {"name": "trustId", "type": "bytes32"}, {"name": "to", "type": "address"}, {"name": "amount", "type": "uint256"} ], "outputs": [] } ] # SHT Service class SHTService: def __init__(self): if not sht_config.ENABLE_SHT: logger.info("SHT module disabled") return self.chainlink = ChainlinkClient( node_url=sht_config.CHAINLINK_NODE_URL, subscription_id=sht_config.CHAINLINK_SUBSCRIPTION_ID ) self.isolation_forest = IsolationForest(contamination=0.1, random_state=42) self.web3 = Web3(Web3.HTTPProvider(os.getenv('ARBITRUM_RPC'))) self.trust_contracts = { 'Nevis': self.web3.eth.contract(address=sht_config.NEVIS_TRUST_ADDRESS, abi=SHT_CONTRACT_ABI), 'Cook Islands': self.web3.eth.contract(address=sht_config.COOK_ISLANDS_TRUST_ADDRESS, abi=SHT_CONTRACT_ABI) } self.zkp = ZKProof() async def fetch_historical_data(self, db: AsyncSession, asset_address: Optional[str] = None) -> List[Decimal]: cache_key = f"sht_data:{asset_address or 'global'}" cached_data = redis_client.get(cache_key) if cached_data: return [Decimal(x) for x in json.loads(cached_data)] query = sa.select(Transaction.amount).where(Transaction.status == 'confirmed') if asset_address: query = query.where(Transaction.token_address == asset_address) result = await db.execute(query) data = [Decimal(str(row.amount)) for row in result.scalars().all()] redis_client.setex(cache_key, 3600, json.dumps([str(x) for x in data])) return data async def notify_user(self, user: User, anomaly: AnomalyReport): email = EmailMessage() email["Subject"] = "SOVRN: Trust Transaction Flagged for Review" email["From"] = sht_config.SMTP_USER email["To"] = user.email email.set_content( f"Dear {user.name},\n\nYour trust transaction (ID: {anomaly.transaction_id}) of {anomaly.value} " f"was flagged as an anomaly ({anomaly.anomaly_type}). Please verify at " f"http://sovrn.example.com/anomalies/resolve or contact support@sovrn.example.com.\n\nSOVRN Team" ) await aiosmtplib.send( email, hostname=sht_config.SMTP_HOST, port=sht_config.SMTP_PORT, username=sht_config.SMTP_USER, password=sht_config.SMTP_PASSWORD, use_tls=True ) logger.info("Notification sent", user_id=user.id, transaction_id=anomaly.transaction_id) @celery.task def detect_anomalies_task(self, transaction_id: str, user_id: str, amount: float, asset_address: str, data: List[float]): value = Decimal(str(amount)) anomalies = [] data_np = np.array(data) # Isolation Forest if len(data) >= sht_config.MIN_DATA_POINTS: X = data_np.reshape(-1, 1) self.isolation_forest.fit(X) if self.isolation_forest.predict([[float(value)]])[0] == -1: anomalies.append({ "transaction_id": transaction_id, "user_id": user_id, "asset_address": asset_address, "anomaly_type": "isolation_forest", "value": value, "threshold": Decimal("0.1"), "status": "flagged" }) # Z-score, IQR, Grubbs, Tukey, Chauvenet, Peirce (same as previous) # [Omitted for brevity] # Fallback for Low Data if len(data) < sht_config.MIN_DATA_POINTS: if abs(float(value) - float(sht_config.FALLBACK_AVERAGE)) / float(sht_config.FALLBACK_AVERAGE) > 2.0: anomalies.append({ "transaction_id": transaction_id, "user_id": user_id, "asset_address": asset_address, "anomaly_type": "fallback", "value": value, "threshold": Decimal("2.0"), "status": "flagged" }) return anomalies async def create_trust(self, request: SHTrustRequest, db: AsyncSession) -> SHTrustResponse: user = await db.get(User, UUID(request.user_id)) if not user or user.kyc_status != KYCStatus.APPROVED: raise HTTPException(status_code=403, detail="KYC verification required") if request.jurisdiction not in ['Nevis', 'Cook Islands']: raise HTTPException(status_code=400, detail="Unsupported jurisdiction") # Quantum-resistant signature message = f"{request.user_id}:{request.amount}:{request.jurisdiction}" signature = self.web3.eth.account.sign_message( encode_defunct(text=message), private_key=sht_config.QUANTUM_KEY ) # ZKP for privacy zkp_hash = self.zkp.generate_proof( inputs={ 'user_id': request.user_id, 'amount': str(request.amount), 'asset_address': request.asset_address or '' } ) # Smart contract call contract = self.trust_contracts[request.jurisdiction] trust_id = contract.functions.createTrust( request.jurisdiction, request.trustee_address, request.beneficiary_address, request.asset_address or '0x0', int(request.amount * 10**18) ).call() # Record trust trust_record = SHTRecord( user_id=UUID(request.user_id), trust_id=UUID(), jurisdiction=request.jurisdiction, trustee_address=request.trustee_address, beneficiary_address=request.beneficiary_address, asset_address=request.asset_address, amount=request.amount, zkp_hash=zkp_hash, compliance_status="pending" ) # Anomaly Detection async with db.begin(): db.add(trust_record) transaction = Transaction( user_id=UUID(request.user_id), type=TransactionType.TRUST_CREATION, from_address=request.asset_address or '0x0', to_address=request.trustee_address, token_address=request.asset_address, amount=request.amount, fee=Decimal('0'), network=NetworkType.ARBITRUM, tx_hash=signature.messageHash.hex() ) db.add(transaction) await db.commit() if sht_config.ENABLE_ANOMALY_DETECTION: data = await self.fetch_historical_data(db, request.asset_address) result = self.detect_anomalies_task.delay( str(transaction.id), str(request.user_id), float(request.amount), request.asset_address or "", [float(d) for d in data] ) anomalies = await asyncio.get_event_loop().run_in_executor(None, lambda: result.get(timeout=10)) for anomaly in anomalies: record = AnomalyRecord( transaction_id=UUID(anomaly["transaction_id"]) if anomaly["transaction_id"] else None, user_id=UUID(anomaly["user_id"]), asset_address=anomaly["asset_address"], anomaly_type=anomaly["anomaly_type"], value=anomaly["value"], threshold=anomaly["threshold"], is_resolved=False ) db.add(record) TRANSACTION_COUNTER.labels(type=f"anomaly_{anomaly.anomaly_type}", status="flagged").inc() await self.notify_user(user, AnomalyReport(**anomaly)) await db.commit() # Compliance Check compliance_status = await self.chainlink.request_compliance_check( user_id=request.user_id, transaction_id=str(trust_id) ) trust_record.compliance_status = compliance_status await db.commit() return SHTrustResponse( trust_id=str(trust_record.trust_id), jurisdiction=request.jurisdiction, trustee_address=request.trustee_address, beneficiary_address=request.beneficiary_address, asset_address=request.asset_address, amount=request.amount, compliance_status=compliance_status, zkp_hash=zkp_hash ) async def process_payment(self, request: QCBPOPaymentRequest, db: AsyncSession) -> QCBPOPaymentResponse: user = await db.get(User, UUID(request.user_id)) if not user or user.kyc_status != KYCStatus.APPROVED: raise HTTPException(status_code=403, detail="KYC verification required") # Select optimal payment rail rails = ['SWIFT', 'MBRIDGE', 'CIPS', 'UPI', 'PIX', 'SPFS'] fees = await self.chainlink.get_data_feed('payment_rail_fees') speeds = await self.chainlink.get_data_feed('payment_rail_speeds') scores = {} for rail in rails: fee = Decimal(str(fees.get(rail, 0.01))) speed = Decimal(str(speeds.get(rail, 60))) score = (1 / fee) * (1 / speed) * (2 if rail == request.preferred_rail else 1) scores[rail] = score optimal_rail = max(scores, key=scores.get) savings = max(Decimal(str(fees.get(r, 0.01))) for r in rails) - Decimal(str(fees.get(optimal_rail, 0.01))) # Quantum-resistant signature signature = self.web3.eth.account.sign_message( encode_defunct(text=f"{request.user_id}:{request.amount}:{optimal_rail}"), private_key=sht_config.QUANTUM_KEY ) # ZKP for privacy zkp_hash = self.zkp.generate_proof( inputs={ 'user_id': request.user_id, 'amount': str(request.amount), 'asset_address': request.asset_address or '' } ) # Chainlink VRF request_id = await self.chainlink.request_vrf() transaction = Transaction( user_id=UUID(request.user_id), type=TransactionType.PAYMENT, from_address=request.from_currency, to_address=request.to_currency, token_address=request.asset_address, amount=request.amount, fee=Decimal('0'), network=NetworkType.ARBITRUM, tx_hash=signature.messageHash.hex() ) qcbpo_record = QCBPORecord( user_id=UUID(request.user_id), payment_id=UUID(), rail=optimal_rail, amount=request.amount, asset_address=request.asset_address, chainlink_request_id=request_id ) # Anomaly Detection async with db.begin(): db.add(transaction) db.add(qcbpo_record) await db.commit() if sht_config.ENABLE_ANOMALY_DETECTION: data = await self.fetch_historical_data(db, request.asset_address) result = self.detect_anomalies_task.delay( str(transaction.id), str(request.user_id), float(request.amount), request.asset_address or "", [float(d) for d in data] ) anomalies = await asyncio.get_event_loop().run_in_executor(None, lambda: result.get(timeout=10)) for anomaly in anomalies: record = AnomalyRecord( transaction_id=UUID(anomaly["transaction_id"]) if anomaly["transaction_id"] else None, user_id=UUID(anomaly["user_id"]), asset_address=anomaly["asset_address"], anomaly_type=anomaly["anomaly_type"], value=anomaly["value"], threshold=anomaly["threshold"], is_resolved=False ) db.add(record) TRANSACTION_COUNTER.labels(type=f"anomaly_{anomaly.anomaly_type}", status="flagged").inc() await self.notify_user(user, AnomalyReport(**anomaly)) await db.commit() # Compliance Check compliance_status = await self.chainlink.request_compliance_check( user_id=request.user_id, transaction_id=str(transaction.id) ) qcbpo_record.compliance_status = compliance_status await db.commit() return QCBPOPaymentResponse( payment_id=str(qcbpo_record.id), rail=optimal_rail, amount=request.amount, asset_address=request.asset_address, compliance_status=compliance_status, chainlink_request_id=request_id, estimated_savings=savings ) # Patch CrossBorderPaymentEngine class CrossBorderPaymentEngineSHT(cross_border_engine.__class__): def __init__(self): super().__init__() self.sht_service = SHTService() async def process_asset_payment(self, user_id: str, request: CrossBorderPaymentRequest) -> CrossBorderPayment: if sht_config.ENABLE_QCBPO: qcbpo_request = QCBPOPaymentRequest( user_id=user_id, from_currency=request.from_currency, to_currency=request.to_currency, amount=request.from_amount, asset_address=request.from_currency, destination=request.to_address, preferred_rail=None ) async with db_manager.get_session() as session: response = await self.sht_service.process_payment(qcbpo_request, session) return CrossBorderPayment( reference_id=response.payment_id, from_currency=request.from_currency, to_currency=request.to_currency, from_amount=request.from_amount, to_amount=request.from_amount, fee=Decimal('0'), status="confirmed" ) return await super().process_asset_payment(user_id, request) # Initialize Patched Service cross_border_engine = CrossBorderPaymentEngineSHT() # FastAPI Endpoints def apply_sht_module(app: FastAPI): if not sht_config.ENABLE_SHT: logger.info("SHT module not applied") return @app.post("/sht/create", response_model=SHTrustResponse) async def create_safe_harbor_trust( request: SHTrustRequest, db: AsyncSession = Depends(db_manager.get_session), _: RateLimiter = Depends(RateLimiter(times=10, seconds=3600)) ): return await SHTService().create_trust(request, db) @app.post("/qcbpo/payment", response_model=QCBPOPaymentResponse) async def process_qcbpo_payment( request: QCBPOPaymentRequest, db: AsyncSession = Depends(db_manager.get_session), _: RateLimiter = Depends(RateLimiter(times=50, seconds=3600)) ): return await SHTService().process_payment(request, db) @app.get("/anomalies", response_model=List[AnomalyReport]) async def get_anomalies( user: User = Depends(get_current_user), db: AsyncSession = Depends(db_manager.get_session), _: RateLimiter = Depends(RateLimiter(times=50, seconds=3600)) ): if user.kyc_status != KYCStatus.APPROVED: raise HTTPException(status_code=403, detail="KYC verification required") result = await db.execute( sa.select(AnomalyRecord).where(AnomalyRecord.user_id == user.id) ) anomalies = result.scalars().all() return [ AnomalyReport( transaction_id=str(a.transaction_id), user_id=str(a.user_id), asset_address=a.asset_address, anomaly_type=a.anomaly_type, value=Decimal(str(a.value)), threshold=Decimal(str(a.threshold)), status="flagged" if not a.is_resolved else "resolved" ) for a in anomalies ] @app.post("/anomalies/resolve", response_model=dict) async def resolve_anomaly( request: AnomalyResolveRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(db_manager.get_session), _: RateLimiter = Depends(RateLimiter(times=10, seconds=3600)) ): if user.kyc_status != KYCStatus.APPROVED: raise HTTPException(status_code=403, detail="KYC verification required") async with db.begin(): anomaly = await db.get(AnomalyRecord, UUID(request.anomaly_id)) if not anomaly or anomaly.user_id != user.id: raise HTTPException(status_code=404, detail="Anomaly not found") anomaly.is_resolved = True anomaly.metadata = json.dumps({"resolution_details": request.resolution_details}) await db.commit() TRANSACTION_COUNTER.labels(type=f"anomaly_{anomaly.anomaly_type}", status="resolved").inc() return {"anomaly_id": str(anomaly.id), "status": "resolved"} # Apply Module apply_sht_module(app) # Update Database Creation async def create_tables_sht(): async with db_manager.engine.begin() as conn: await conn.run_sync(Base.metadata.create_all) # Update Lifespan @asynccontextmanager async def lifespan_sht(app: FastAPI): await redis_manager.connect() await create_tables_sht() await FastAPILimiter.init(redis_manager.redis) yield await FastAPILimiter.close() await redis_manager.redis.close() app.lifespan = lifespan_sht
+
+
+
+
+
+
+
+
+
+
+
+
+
+Update
+
+plaintext
+
+ENABLE_SHT=false ENABLE_QCBPO=true ENABLE_ANOMALY_DETECTION=true ZSCORE_THRESHOLD=3.0 IQR_MULTIPLIER=1.5 GRUBBS_ALPHA=0.05 CHAUVENET_THRESHOLD=0.5 PEIRCE_THRESHOLD=1.0 MIN_DATA_POINTS=10 FALLBACK_AVERAGE=1000 SMTP_HOST=smtp.gmail.com SMTP_PORT=587 SMTP_USER=<your_smtp_user> SMTP_PASSWORD=<your_smtp_password> REDIS_URL=redis://localhost:6379/0 CHAINLINK_NODE_URL=<your_chainlink_node_url> CHAINLINK_SUBSCRIPTION_ID=<your_chainlink_subscription_id> QUANTUM_KEY=<your_quantum_resistant_key> NEVIS_TRUST_ADDRESS=0xnevis_trust COOK_ISLANDS_TRUST_ADDRESS=0xcook_islands_trust ARBITRUM_RPC=<your_arbitrum_rpc>
+
+Updated Requirements: requirements.txt
+
+plaintext
+
+scipy==1.14.1 numpy==1.26.4 scikit-learn==1.5.2 celery==5.4.0 redis==5.0.8 aiosmtplib==3.0.2 web3==6.20.0 chainlink==0.1.0 zkproof==0.1.0 # Hypothetical ZKP library
+
+Installation
+
+Install dependencies:
+
+bash
+
+pip install -r requirements.txt
+
+Deploy smart contracts to Arbitrum:
+
+bash
+
+# Use Hardhat/Truffle to deploy SHT_CONTRACT_ABI npx hardhat deploy --network arbitrum
+
+Run Redis and Celery:
+
+bash
+
+redis-server celery -A sovrn_dex_sht_module.celery worker --loglevel=info
+
+Applying the Patch
+
+Backup Code
+
+bash
+
+cp sovrn_dex.py sovrn_dex_backup.py cp sovrn_dex_patch.py sovrn_dex_patch_backup.py
+
+Apply Patch
+
+Save sovrn_dex_sht_module.py.
+
+Update sovrn_dex_patch.py:
+
+python
+
+from sovrn_dex_sht_module import apply_sht_module apply_sht_module(app)
+
+Test Endpoints
+
+Enable: Set ENABLE_SHT=true in .env.
+
+Create trust:
+
+bash
+
+curl -X POST http://localhost:8000/sht/create \ -H "Authorization: Bearer <your_jwt_token>" \ -H "Content-Type: application/json" \ -d '{ "user_id": "<user_id>", "jurisdiction": "Nevis", "trustee_address": "<non_us_trustee_address>", "beneficiary_address": "<beneficiary_address>", "asset_address": "0x1234567890abcdef1234567890abcdef12345678", "amount": 10000 }'
+
+Process payment:
+
+bash
+
+curl -X POST http://localhost:8000/qcbpo/payment \ -H "Authorization: Bearer <your_jwt_token>" \ -H "Content-Type: application/json" \ -d '{ "user_id": "<user_id>", "from_currency": "0x1234567890abcdef1234567890abcdef12345678", "to_currency": "0xabcdef1234567890abcdef1234567890abcdef12", "amount": 10000, "asset_address": "0x1234567890abcdef1234567890abcdef12345678", "destination": "<recipient_address>", "preferred_rail": "MBRIDGE" }'
+
+Check anomalies:
+
+bash
+
+curl -X GET http://localhost:8000/anomalies \ -H "Authorization: Bearer <your_jwt_token>"
+
+Resolve anomaly:
+
+bash
+
+curl -X POST http://localhost:8000/anomalies/resolve \ -H "Authorization: Bearer <your_jwt_token>" \ -H "Content-Type: application/json" \ -d '{ "anomaly_id": "<anomaly_id>", "resolution_details": "Verified via KYC" }'
+
+
+
+
+
+
+
+
+
+
+
