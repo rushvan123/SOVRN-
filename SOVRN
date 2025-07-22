@@ -1,1 +1,961 @@
 
+SOVRN
+
+```python
+import asyncio
+import json
+import hashlib
+import logging
+import time
+import uuid
+import os
+import secrets
+from datetime import datetime, timedelta
+from decimal import Decimal
+from typing import Dict, Optional, Tuple, List
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from enum import Enum
+from fastapi import FastAPI, HTTPException, Depends, Request, status, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+from pydantic import BaseModel, Field
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
+from eth_account import Account
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+import pyotp
+from cryptography.fernet import Fernet
+from sqlalchemy import Column, String, Numeric, DateTime, Boolean, Integer, ForeignKey, Text, BigInteger
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.dialects.postgresql import UUID
+import structlog
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+import aiohttp
+import aioredis
+import redis.asyncio as redis
+from dotenv import load_dotenv
+import sqlalchemy as sa
+import uvicorn
+
+load_dotenv()
+
+# Configuration
+class Config:
+    DB_DSN = os.getenv('DB_DSN', 'postgresql+asyncpg://sovrn:sovrn_secure_pass@localhost:5432/sovrn_dex')
+    REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+    ARBITRUM_RPC = os.getenv('ARBITRUM_RPC', 'https://arb1.arbitrum.io/rpc')
+    SOVRN_TOKEN_ADDRESS = os.getenv('SOVRN_TOKEN_ADDRESS', '0x742d35Cc6634C0532925a3b8D369E2b7b3b3abcd')
+    BRICS_UNIT_ADDRESS = os.getenv('BRICS_UNIT_ADDRESS', '0x1a2b3c4d5e6f7890abcdef1234567890abcdef12')
+    COSMIC_ENTROPY_ADDRESS = os.getenv('COSMIC_ENTROPY_ADDRESS', '')  # Update after deployment
+    CHAINLINK_SUBSCRIPTION_ID = os.getenv('CHAINLINK_SUBSCRIPTION_ID', '')  # Update after subscription
+    CHAINLINK_VRF_COORDINATOR = os.getenv('CHAINLINK_VRF_COORDINATOR', '0x2716821059F3A37E721360803165dC8bB0aC18B8')
+    CHAINLINK_KEY_HASH = os.getenv('CHAINLINK_KEY_HASH', '0xd9af33116d2500a4042f8d1a155c6f9558361855c3f7a97a76908cd208c466b2')
+    OWNER_PRIVATE_KEY = os.getenv('OWNER_PRIVATE_KEY', '')  # Multisig key
+    JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', secrets.token_urlsafe(64))
+    ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', Fernet.generate_key().decode())
+    CIPS_API_KEY = os.getenv('CIPS_API_KEY', 'cips_production_key_2024')
+    CIPS_API_URL = os.getenv('CIPS_API_URL', 'https://api.cips.com.cn/v2/')
+    UPI_API_KEY = os.getenv('UPI_API_KEY', 'upi_production_key_2024')
+    UPI_API_URL = os.getenv('UPI_API_URL', 'https://api.npci.org.in/v2/')
+    PIX_API_KEY = os.getenv('PIX_API_KEY', 'pix_production_key_2024')
+    PIX_API_URL = os.getenv('PIX_API_URL', 'https://api.bcb.gov.br/pix/v2/')
+    SPFS_API_KEY = os.getenv('SPFS_API_KEY', 'spfs_production_key_2024')
+    SPFS_API_URL = os.getenv('SPFS_API_URL', 'https://api.spfs.cbr.ru/v2/')
+    SWIFT_API_KEY = os.getenv('SWIFT_API_KEY', 'swift_production_key_2024')
+    SWIFT_API_URL = os.getenv('SWIFT_API_URL', 'https://api.swift.com/gpi/v2/')
+    MBRIDGE_API_URL = os.getenv('MBRIDGE_API_URL', 'https://api.mbridge.biscent.org/v2/')
+    SUMSUB_API_KEY = os.getenv('SUMSUB_API_KEY', 'sumsub_production_key_2024')
+    SUMSUB_API_URL = os.getenv('SUMSUB_API_URL', 'https://api.sumsub.com')
+    SUPPORTED_FIAT = ['USD', 'CNY', 'INR', 'RUB', 'BRL', 'EUR']
+    SUPPORTED_CRYPTO = ['ETH', 'USDT', 'USDC', 'SOVRN', 'BRICS_UNIT']
+    SUPPORTED_NETWORKS = ['arbitrum']
+    MIN_TRADE_AMOUNT = Decimal('0.01')
+    MAX_TRADE_AMOUNT = Decimal('1000000')
+    DEX_FEE_RATE = Decimal('0.002')
+    CROSS_BORDER_FEE_RATE = Decimal('0.003')
+    RATE_LIMIT_REQUESTS = 1000
+    RATE_LIMIT_WINDOW = 3600
+    RATE_LIMIT_VRF_REQUESTS = 10
+    MIN_PROPOSAL_TOKENS = Decimal('10000')
+    VOTING_PERIOD_HOURS = 168
+    BRICS_UNIT_BASKET = {
+        'CNY': Decimal('0.40'),
+        'INR': Decimal('0.25'),
+        'RUB': Decimal('0.15'),
+        'BRL': Decimal('0.10'),
+        'ZAR': Decimal('0.05'),
+        'GOLD': Decimal('0.05')
+    }
+    JWT_EXPIRATION_TIME = 3600  # 1 hour
+
+config = Config()
+
+# Logging
+structlog.configure(
+    processors=[
+        structlog.stdlib.filter_by_level,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer()
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+logger = structlog.get_logger()
+
+# Metrics
+TRANSACTION_COUNTER = Counter('sovrn_transactions_total', 'Total transactions', ['type', 'status'])
+VRF_REQUEST_COUNTER = Counter('sovrn_vrf_requests_total', 'Chainlink VRF requests', ['status'])
+LIQUIDITY_GAUGE = Gauge('sovrn_total_liquidity', 'Total liquidity', ['pool'])
+
+# Enums
+class TransactionStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+
+class TransactionType(str, Enum):
+    TRANSFER = "transfer"
+    SWAP = "swap"
+    CROSS_BORDER = "cross_border"
+    BRICS_UNIT = "brics_unit"
+
+class NetworkType(str, Enum):
+    ARBITRUM = "arbitrum"
+
+class KYCStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+# Database Models
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String, unique=True, nullable=False, index=True)
+    wallet_address = Column(String, unique=True, nullable=False, index=True)
+    password_hash = Column(String, nullable=False)
+    mfa_secret = Column(String)
+    kyc_status = Column(String, default=KYCStatus.PENDING)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    transactions = relationship("Transaction", back_populates="user")
+    vrf_requests = relationship("VRFRequest")
+    brics_positions = relationship("BRICSUnitPosition", back_populates="user")
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    type = Column(String, nullable=False)
+    status = Column(String, nullable=False, default=TransactionStatus.PENDING)
+    from_address = Column(String, nullable=False)
+    to_address = Column(String, nullable=False)
+    token_address = Column(String, nullable=False)
+    amount = Column(Numeric(36, 18), nullable=False)
+    fee = Column(Numeric(36, 18), nullable=False)
+    tx_hash = Column(String, unique=True, index=True)
+    network = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", back_populates="transactions")
+
+class LiquidityPool(Base):
+    __tablename__ = "liquidity_pools"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    token_a_address = Column(String, nullable=False)
+    token_b_address = Column(String, nullable=False)
+    reserve_a = Column(Numeric(36, 18), nullable=False)
+    reserve_b = Column(Numeric(36, 18), nullable=False)
+    fee_rate = Column(Numeric(10, 6), nullable=False)
+    network = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class CrossBorderPayment(Base):
+    __tablename__ = "cross_border_payments"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    from_currency = Column(String, nullable=False)
+    to_currency = Column(String, nullable=False)
+    from_amount = Column(Numeric(36, 18), nullable=False)
+    to_amount = Column(Numeric(36, 18), nullable=False)
+    exchange_rate = Column(Numeric(36, 18), nullable=False)
+    fee = Column(Numeric(36, 18), nullable=False)
+    payment_method = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
+    reference_id = Column(String, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User")
+
+class VRFRequest(Base):
+    __tablename__ = "vrf_requests"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    request_id = Column(BigInteger, nullable=False, unique=True)
+    status = Column(String, nullable=False, default="pending")
+    randomness = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    fulfilled_at = Column(DateTime, nullable=True)
+
+class BRICSUnitPosition(Base):
+    __tablename__ = "brics_unit_positions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    amount = Column(Numeric(36, 18), nullable=False)
+    unit_value = Column(Numeric(36, 18), nullable=False)
+    position_type = Column(String, nullable=False)
+    tx_hash = Column(String, nullable=True)
+    metadata = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", back_populates="brics_positions")
+
+class GovernanceProposal(Base):
+    __tablename__ = "governance_proposals"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    status = Column(String, nullable=False, default="active")
+    voting_ends_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class GovernanceVote(Base):
+    __tablename__ = "governance_votes"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    proposal_id = Column(UUID(as_uuid=True), ForeignKey("governance_proposals.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    vote_power = Column(Numeric(36, 18), nullable=False)
+    vote_choice = Column(String, nullable=False)
+    metadata = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# Pydantic Models
+class UserCreate(BaseModel):
+    email: str = Field(..., pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+    password: str = Field(..., min_length=8)
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    wallet_address: str
+    kyc_status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class SwapRequest(BaseModel):
+    token_in: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+    token_out: str = Field(..., pattern=r"^0x[a-fA-F0-9]{40}$")
+    amount_in: Decimal = Field(..., gt=0)
+    min_amount_out: Decimal = Field(..., ge=0)
+    network: NetworkType = NetworkType.ARBITRUM
+
+class CrossBorderPaymentRequest(BaseModel):
+    from_currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+    to_currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+    amount: Decimal = Field(..., gt=0)
+    recipient_id: str
+    payment_method: str = Field(..., pattern=r"^(CIPS|UPI|PIX|SPFS|SWIFT|MBRIDGE)$")
+
+class BRICSUnitMintRequest(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+
+class GovernanceVoteRequest(BaseModel):
+    proposal_id: str
+    vote_choice: str = Field(..., pattern=r"^(for|against|abstain)$")
+
+# Managers
+class DatabaseManager:
+    def __init__(self):
+        self.engine = create_async_engine(config.DB_DSN, pool_size=10, max_overflow=20)
+        self.SessionLocal = sessionmaker(bind=self.engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def create_tables(self):
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def get_session(self):
+        async with self.SessionLocal() as session:
+            yield session
+
+class RedisManager:
+    async def connect(self):
+        self.redis = redis.from_url(config.REDIS_URL, decode_responses=True)
+        try:
+            await self.redis.ping()
+        except Exception as e:
+            logger.error(f"Redis connection failed: {str(e)}")
+            raise
+
+    async def get(self, key: str):
+        return await self.redis.get(key)
+
+    async def set(self, key: str, value: str, expire: int = 3600):
+        await self.redis.set(key, value, ex=expire)
+
+class Web3Manager:
+    def __init__(self):
+        self.w3 = Web3(Web3.HTTPProvider(config.ARBITRUM_RPC))
+        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+
+    async def get_balance(self, address: str, token_address: str) -> Decimal:
+        if token_address == "0x0000000000000000000000000000000000000000":
+            balance = self.w3.eth.get_balance(address)
+            return Decimal(balance) / Decimal(10**18)
+        
+        contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(token_address),
+            abi=self._get_erc20_abi()
+        )
+        balance = contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+        decimals = contract.functions.decimals().call()
+        return Decimal(balance) / Decimal(10**decimals)
+
+    async def transfer_tokens(self, from_address: str, to_address: str, token_address: str, amount: Decimal) -> str:
+        contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(token_address),
+            abi=self._get_erc20_abi()
+        )
+        decimals = contract.functions.decimals().call()
+        amount_wei = int(amount * Decimal(10**decimals))
+        
+        tx = contract.functions.transfer(
+            Web3.to_checksum_address(to_address),
+            amount_wei
+        ).build_transaction({
+            'from': Web3.to_checksum_address(from_address),
+            'nonce': self.w3.eth.get_transaction_count(from_address),
+            'gas': 100000,
+            'gasPrice': self.w3.eth.gas_price
+        })
+        
+        signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=config.OWNER_PRIVATE_KEY)
+        tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        return tx_hash.hex()
+
+    def _get_erc20_abi(self):
+        return [
+            {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
+            {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+            {"constant": False, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "success", "type": "bool"}], "type": "function"}
+        ]
+
+class AuthManager:
+    def __init__(self):
+        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    
+    def verify_password(self, plain_password: str, hashed_password: str) -> bool:
+        return self.pwd_context.verify(plain_password, hashed_password)
+    
+    def get_password_hash(self, password: str) -> str:
+        return self.pwd_context.hash(password)
+    
+    async def create_access_token(self, data: dict) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + timedelta(seconds=config.JWT_EXPIRATION_TIME)
+        to_encode.update({"exp": expire})
+        return jwt.encode(to_encode, config.JWT_SECRET_KEY, algorithm="HS256")
+    
+    async def verify_token(self, token: str) -> dict:
+        try:
+            payload = jwt.decode(token, config.JWT_SECRET_KEY, algorithms=["HS256"])
+            return payload
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    
+    async def verify_mfa(self, user: User, totp_code: str) -> bool:
+        if not user.mfa_secret:
+            raise HTTPException(status_code=400, detail="MFA not set up")
+        totp = pyotp.TOTP(user.mfa_secret)
+        return totp.verify(totp_code)
+
+class DEXEngine:
+    async def get_pool(self, token_a: str, token_b: str, network: NetworkType) -> Optional[LiquidityPool]:
+        async with db_manager.get_session() as session:
+            result = await session.execute(
+                sa.select(LiquidityPool).where(
+                    sa.or_(
+                        sa.and_(LiquidityPool.token_a_address == token_a, LiquidityPool.token_b_address == token_b),
+                        sa.and_(LiquidityPool.token_a_address == token_b, LiquidityPool.token_b_address == token_a)
+                    ),
+                    LiquidityPool.network == network
+                )
+            )
+            return result.scalars().first()
+    
+    async def calculate_swap_amount(self, pool: LiquidityPool, amount_in: Decimal, token_in: str) -> Decimal:
+        fee = amount_in * pool.fee_rate
+        amount_in_with_fee = amount_in - fee
+        
+        if token_in == pool.token_a_address:
+            amount_out = (pool.reserve_b * amount_in_with_fee) / (pool.reserve_a + amount_in_with_fee)
+        else:
+            amount_out = (pool.reserve_a * amount_in_with_fee) / (pool.reserve_b + amount_in_with_fee)
+        
+        return amount_out
+    
+    async def execute_swap(self, user_id: str, swap_request: SwapRequest) -> Transaction:
+        async with db_manager.get_session() as session:
+            pool = await self.get_pool(swap_request.token_in, swap_request.token_out, swap_request.network)
+            if not pool:
+                raise HTTPException(status_code=404, detail="Liquidity pool not found")
+            
+            amount_out = await self.calculate_swap_amount(pool, swap_request.amount_in, swap_request.token_in)
+            if amount_out < swap_request.min_amount_out:
+                raise HTTPException(status_code=400, detail="Slippage too high")
+            
+            user = await session.get(User, user_id)
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+            
+            transaction = Transaction(
+                user_id=user_id,
+                type=TransactionType.SWAP,
+                from_address=user.wallet_address,
+                to_address=pool.token_b_address if swap_request.token_in == pool.token_a_address else pool.token_a_address,
+                token_address=swap_request.token_in,
+                amount=swap_request.amount_in,
+                fee=swap_request.amount_in * pool.fee_rate,
+                network=swap_request.network,
+                tx_hash=await web3_manager.transfer_tokens(
+                    user.wallet_address,
+                    pool.token_b_address if swap_request.token_in == pool.token_a_address else pool.token_a_address,
+                    swap_request.token_in,
+                    swap_request.amount_in
+                )
+            )
+            session.add(transaction)
+            await session.commit()
+            
+            TRANSACTION_COUNTER.labels(type="swap", status="pending").inc()
+            return transaction
+
+class CrossBorderPaymentEngine:
+    def __init__(self):
+        self.session = aiohttp.ClientSession()
+        self.payment_processors = {
+            'CIPS': self._process_cips,
+            'UPI': self._process_upi,
+            'PIX': self._process_pix,
+            'SPFS': self._process_spfs,
+            'SWIFT': self._process_swift,
+            'MBRIDGE': self._process_mbridge
+        }
+    
+    async def process_payment(self, user_id: str, request: CrossBorderPaymentRequest) -> CrossBorderPayment:
+        if request.payment_method not in self.payment_processors:
+            raise HTTPException(status_code=400, detail="Unsupported payment method")
+        
+        exchange_rate = await self._get_exchange_rate(request.from_currency, request.to_currency)
+        to_amount = request.amount * exchange_rate
+        fee = request.amount * config.CROSS_BORDER_FEE_RATE
+        
+        async with db_manager.get_session() as session:
+            payment = CrossBorderPayment(
+                user_id=user_id,
+                from_currency=request.from_currency,
+                to_currency=request.to_currency,
+                from_amount=request.amount,
+                to_amount=to_amount,
+                exchange_rate=exchange_rate,
+                fee=fee,
+                payment_method=request.payment_method,
+                reference_id=str(uuid.uuid4())
+            )
+            session.add(payment)
+            await session.commit()
+            
+            await self.payment_processors[request.payment_method](payment, request.recipient_id)
+            
+            TRANSACTION_COUNTER.labels(type="cross_border", status="confirmed").inc()
+            return payment
+    
+    async def _get_exchange_rate(self, from_currency: str, to_currency: str) -> Decimal:
+        async with self.session.get(f"https://api.exchangerate-api.com/v4/latest/{from_currency}") as response:
+            if response.status == 200:
+                data = await response.json()
+                return Decimal(str(data['rates'][to_currency]))
+        return Decimal('1.0')
+    
+    async def _process_cips(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.CIPS_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_id': recipient_id, 'reference': payment.reference_id},
+            headers={'Authorization': f'Bearer {config.CIPS_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+    
+    async def _process_upi(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.UPI_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_upi_id': recipient_id, 'reference': payment.reference_id},
+            headers={'Authorization': f'Bearer {config.UPI_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+    
+    async def _process_pix(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.PIX_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_pix_key': recipient_id, 'reference': payment.reference_id},
+            headers={'Authorization': f'Bearer {config.PIX_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+    
+    async def _process_spfs(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.SPFS_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_id': recipient_id, 'reference': payment.reference_id},
+            headers={'Authorization': f'Bearer {config.SPFS_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+    
+    async def _process_swift(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.SWIFT_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_iban': recipient_id, 'reference': payment.reference_id, 'sender_bic': 'SOVRNBIC'},
+            headers={'Authorization': f'Bearer {config.SWIFT_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+    
+    async def _process_mbridge(self, payment: CrossBorderPayment, recipient_id: str):
+        async with self.session.post(
+            f'{config.MBRIDGE_API_URL}/payments',
+            json={'amount': str(payment.to_amount), 'currency': payment.to_currency, 'recipient_id': recipient_id, 'reference': payment.reference_id},
+            headers={'Authorization': f'Bearer {config.MBRIDGE_API_KEY}'}
+        ) as response:
+            payment.status = 'confirmed' if response.status == 200 else 'failed'
+            async with db_manager.get_session() as session:
+                session.add(payment)
+                await session.commit()
+
+class BRICSUnitService:
+    def __init__(self):
+        self.w3 = Web3(Web3.HTTPProvider(config.ARBITRUM_RPC))
+        self.w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        self.cosmic_entropy = self.w3.eth.contract(
+            address=Web3.to_checksum_address(config.COSMIC_ENTROPY_ADDRESS),
+            abi=[
+                {"inputs": [{"internalType": "uint64", "name": "_subscriptionId", "type": "uint64"}], "stateMutability": "nonpayable", "type": "constructor"},
+                {"anonymous": False, "inputs": [{"indexed": True, "internalType": "uint256", "name": "requestId", "type": "uint256"}], "name": "VRFRequest", "type": "event"},
+                {"anonymous": False, "inputs": [{"indexed": True, "internalType": "uint256", "name": "requestId", "type": "uint256"}, {"indexed": False, "internalType": "bytes32", "name": "entropy", "type": "bytes32"}], "name": "VRFFulfilled", "type": "event"},
+                {"inputs": [], "name": "getLatestEntropy", "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}], "stateMutability": "view", "type": "function"},
+                {"inputs": [], "name": "requestVRF", "outputs": [{"internalType": "uint256", "name": "requestId", "type": "uint256"}], "stateMutability": "nonpayable", "type": "function"},
+                {"inputs": [{"internalType": "uint64", "name": "_subscriptionId", "type": "uint64"}], "name": "setSubscriptionId", "outputs": [], "stateMutability": "nonpayable", "type": "function"}
+            ]
+        )
+        self.owner_account = Account.from_key(config.OWNER_PRIVATE_KEY)
+        self.basket_weights = config.BRICS_UNIT_BASKET
+    
+    async def request_vrf_randomness(self, user_id: str, db: AsyncSession) -> int:
+        async with db.begin():
+            user = await db.get(User, user_id)
+            if not user or user.kyc_status != KYCStatus.APPROVED:
+                raise HTTPException(status_code=403, detail="KYC verification required")
+            
+            tx = self.cosmic_entropy.functions.requestVRF().build_transaction({
+                'from': self.owner_account.address,
+                'nonce': self.w3.eth.get_transaction_count(self.owner_account.address),
+                'gas': 200000,
+                'gasPrice': self.w3.eth.gas_price,
+                'chainId': 42161
+            })
+            signed_tx = self.w3.eth.account.sign_transaction(tx, config.OWNER_PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            request_id = self.cosmic_entropy.events.VRFRequest().process_receipt(receipt)[0]['args']['requestId']
+            
+            vrf_request = VRFRequest(
+                user_id=user_id,
+                request_id=request_id,
+                status="pending"
+            )
+            db.add(vrf_request)
+            await db.commit()
+            
+            VRF_REQUEST_COUNTER.labels(status="success").inc()
+            return request_id
+    
+    async def get_vrf_randomness(self, request_id: int, db: AsyncSession) -> str:
+        async with db.begin():
+            vrf_request = await db.execute(sa.select(VRFRequest).where(VRFRequest.request_id == request_id))
+            vrf_request = vrf_request.scalar_one_or_none()
+            if not vrf_request:
+                raise HTTPException(status_code=404, detail="VRF request not found")
+            
+            randomness = self.cosmic_entropy.functions.getLatestEntropy().call()
+            randomness_hex = '0x' + randomness.hex()
+            
+            if randomness == bytes(32):
+                VRF_REQUEST_COUNTER.labels(status="failed").inc()
+                raise HTTPException(status_code=400, detail="Randomness not yet fulfilled")
+            
+            vrf_request.randomness = randomness_hex
+            vrf_request.status = "fulfilled"
+            vrf_request.fulfilled_at = datetime.utcnow()
+            await db.commit()
+            
+            VRF_REQUEST_COUNTER.labels(status="success").inc()
+            return randomness_hex
+    
+    async def mint_brics_unit(self, amount: Decimal, user_id: str, db: AsyncSession) -> dict:
+        async with db.begin():
+            user = await db.get(User, user_id)
+            if not user or user.kyc_status != KYCStatus.APPROVED:
+                raise HTTPException(status_code=403, detail="KYC verification required")
+            
+            request_id = await self.request_vrf_randomness(user_id, db)
+            await asyncio.sleep(30)
+            randomness = await self.get_vrf_randomness(request_id, db)
+            unit_value = await self.calculate_brics_unit_value()
+            
+            mint_tx = await web3_manager.transfer_tokens(
+                user.wallet_address,
+                config.BRICS_UNIT_ADDRESS,
+                config.SOVRN_TOKEN_ADDRESS,
+                amount
+            )
+            
+            brics_position = BRICSUnitPosition(
+                user_id=user_id,
+                amount=amount,
+                unit_value=unit_value,
+                position_type="mint",
+                tx_hash=mint_tx,
+                metadata=f"Randomness: {randomness}"
+            )
+            db.add(brics_position)
+            await db.commit()
+            
+            return {
+                "position_id": str(brics_position.id),
+                "amount": amount,
+                "unit_value": unit_value,
+                "tx_hash": mint_tx,
+                "randomness": randomness,
+                "status": "completed"
+            }
+    
+    async def calculate_brics_unit_value(self) -> Decimal:
+        async with aiohttp.ClientSession() as session:
+            peg_value = Decimal('0')
+            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=gold&vs_currencies=usd") as response:
+                if response.status == 200:
+                    gold_price = Decimal(str((await response.json())['gold']['usd']))
+                    peg_value += config.BRICS_UNIT_BASKET['GOLD'] * gold_price
+            
+            for currency, weight in config.BRICS_UNIT_BASKET.items():
+                if currency == 'GOLD':
+                    continue
+                async with session.get(f"https://api.exchangerate-api.com/v4/latest/{currency}") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        usd_rate = Decimal(str(data['rates']['USD']))
+                        peg_value += weight * usd_rate
+            
+            return peg_value
+
+# Initialize Managers
+db_manager = DatabaseManager()
+redis_manager = RedisManager()
+web3_manager = Web3Manager()
+auth_manager = AuthManager()
+dex_engine = DEXEngine()
+cross_border_engine = CrossBorderPaymentEngine()
+brics_unit_service = BRICSUnitService()
+
+# FastAPI App
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await redis_manager.connect()
+    await db_manager.create_tables()
+    await FastAPILimiter.init(redis_manager.redis)
+    yield
+    await FastAPILimiter.close()
+    await redis_manager.redis.close()
+
+app = FastAPI(title="SOVRN DEX", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Authentication Endpoints
+@app.post("/register", response_model=UserResponse)
+async def register_user(user_data: UserCreate, _: RateLimiter = Depends(RateLimiter(times=10, seconds=3600))):
+    async with db_manager.get_session() as session:
+        existing_user = await session.execute(sa.select(User).where(User.email == user_data.email))
+        if existing_user.scalars().first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        account = Account.create()
+        user = User(
+            email=user_data.email.lower(),
+            wallet_address=account.address,
+            password_hash=auth_manager.get_password_hash(user_data.password),
+            mfa_secret=pyotp.random_base32()
+        )
+        session.add(user)
+        await session.commit()
+        return UserResponse.from_orm(user)
+
+@app.post("/token")
+async def login(email: str = Form(...), password: str = Form(...), 
+               _: RateLimiter = Depends(RateLimiter(times=20, seconds=3600))):
+    async with db_manager.get_session() as session:
+        user = await session.execute(sa.select(User).where(User.email == email))
+        user = user.scalars().first()
+        if not user or not auth_manager.verify_password(password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        access_token = await auth_manager.create_access_token({"sub": str(user.id), "email": user.email})
+        return {"access_token": access_token, "token_type": "bearer"}
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = await auth_manager.verify_token(token)
+    async with db_manager.get_session() as session:
+        user = await session.get(User, payload.get("sub"))
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return user
+
+# Core Endpoints
+@app.post("/swap")
+async def swap_tokens(swap_data: SwapRequest, user: User = Depends(get_current_user),
+                     _: RateLimiter = Depends(RateLimiter(times=100, seconds=3600))):
+    return await dex_engine.execute_swap(str(user.id), swap_data)
+
+@app.post("/cross-border")
+async def create_cross_border_payment(payment_data: CrossBorderPaymentRequest, user: User = Depends(get_current_user),
+                                      _: RateLimiter = Depends(RateLimiter(times=50, seconds=3600))):
+    return await cross_border_engine.process_payment(str(user.id), payment_data)
+
+@app.post("/brics-unit/mint")
+async def mint_brics_unit(request: BRICSUnitMintRequest, user: User = Depends(get_current_user),
+                         db: AsyncSession = Depends(db_manager.get_session),
+                         _: RateLimiter = Depends(RateLimiter(times=50, seconds=3600))):
+    return await brics_unit_service.mint_brics_unit(request.amount, str(user.id), db)
+
+@app.post("/vrf/request")
+async def request_vrf(user: User = Depends(get_current_user), 
+                     db: AsyncSession = Depends(db_manager.get_session),
+                     _: RateLimiter = Depends(RateLimiter(times=config.RATE_LIMIT_VRF_REQUESTS, seconds=3600))):
+    request_id = await brics_unit_service.request_vrf_randomness(str(user.id), db)
+    return {"request_id": request_id}
+
+@app.get("/vrf/randomness/{request_id}")
+async def get_vrf_randomness(request_id: str, user: User = Depends(get_current_user),
+                             db: AsyncSession = Depends(db_manager.get_session),
+                             _: RateLimiter = Depends(RateLimiter(times=config.RATE_LIMIT_VRF_REQUESTS, seconds=3600))):
+    try:
+        randomness = await brics_unit_service.get_vrf_randomness(int(request_id), db)
+        return {"request_id": request_id, "randomness": randomness}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request_id format")
+
+@app.post("/governance/vote")
+async def vote_on_proposal(vote_data: GovernanceVoteRequest, user: User = Depends(get_current_user),
+                          db: AsyncSession = Depends(db_manager.get_session),
+                          background_tasks: BackgroundTasks = BackgroundTasks(),
+                          _: RateLimiter = Depends(RateLimiter(times=50, seconds=3600))):
+    async with db.begin():
+        proposal = await db.get(GovernanceProposal, vote_data.proposal_id)
+        if not proposal:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        if proposal.status != "active":
+            raise HTTPException(status_code=400, detail="Proposal not active")
+        if datetime.utcnow() > proposal.voting_ends_at:
+            raise HTTPException(status_code=400, detail="Voting period has ended")
+        
+        existing_vote = await db.execute(sa.select(GovernanceVote).where(
+            GovernanceVote.proposal_id == vote_data.proposal_id,
+            GovernanceVote.user_id == user.id
+        ))
+        if existing_vote.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Already voted")
+        
+        request_id = await brics_unit_service.request_vrf_randomness(str(user.id), db)
+        background_tasks.add_task(monitor_vrf_completion, request_id, db)
+        
+        vote_power = await web3_manager.get_balance(user.wallet_address, config.SOVRN_TOKEN_ADDRESS)
+        
+        vote = GovernanceVote(
+            proposal_id=vote_data.proposal_id,
+            user_id=user.id,
+            vote_power=vote_power,
+            vote_choice=vote_data.vote_choice,
+            metadata=f"VRF requestId: {request_id}"
+        )
+        db.add(vote)
+        await db.commit()
+        
+        return {
+            "vote_id": str(vote.id),
+            "proposal_id": vote_data.proposal_id,
+            "vote_choice": vote_data.vote_choice,
+            "vote_power": vote_power,
+            "vrf_request_id": request_id,
+            "status": "recorded"
+        }
+
+async def monitor_vrf_completion(request_id: int, db: AsyncSession):
+    for _ in range(10):
+        try:
+            randomness = await brics_unit_service.get_vrf_randomness(request_id, db)
+            if randomness != '0x' + '0' * 64:
+                logger.info("VRF randomness fulfilled", request_id=request_id)
+                return
+        except:
+            await asyncio.sleep(10)
+    logger.warning("VRF randomness not fulfilled", request_id=request_id)
+    VRF_REQUEST_COUNTER.labels(status="failed").inc()
+
+# Health Check
+@app.get("/health")
+async def health_check():
+    checks = {"database": False, "redis": False, "blockchain": False}
+    try:
+        async with db_manager.get_session() as session:
+            await session.execute(sa.text("SELECT 1"))
+            checks["database"] = True
+    except:
+        pass
+    
+    try:
+        await redis_manager.redis.ping()
+        checks["redis"] = True
+    except:
+        pass
+    
+    try:
+        web3_manager.w3.eth.block_number
+        checks["blockchain"] = True
+    except:
+        pass
+    
+    status = "healthy" if all(checks.values()) else "unhealthy"
+    return {"status": status, "checks": checks}
+
+@app.get("/metrics")
+async def metrics():
+    return generate_latest()
+
+if __name__ == "__main__":
+    uvicorn.run("sovrn_dex:app", host="0.0.0.0", port=8000, log_level="info")
+```
+
+**Requirements.txt:**
+```plaintext
+fastapi==0.103.0
+uvicorn==0.23.2
+aiohttp==3.8.5
+asyncpg==0.28.0
+redis==5.0.0
+web3==6.0.0
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
+pyotp==2.9.0
+cryptography==41.0.3
+structlog==23.1.0
+python-dotenv==1.0.0
+fastapi-limiter==0.1.5
+prometheus-client==0.17.0
+sqlalchemy[asyncio]==2.0.25
+```
+
+**Deployment Steps:**
+
+1. **Set Up Environment:**
+```bash
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Create .env file
+cat > .env <<EOL
+DB_DSN=postgresql+asyncpg://sovrn:sovrn_secure_pass@localhost:5432/sovrn_dex
+REDIS_URL=redis://localhost:6379/0
+ARBITRUM_RPC=https://arb1.arbitrum.io/rpc
+SOVRN_TOKEN_ADDRESS=0x742d35Cc6634C0532925a3b8D369E2b7b3b3abcd
+BRICS_UNIT_ADDRESS=0x1a2b3c4d5e6f7890abcdef1234567890abcdef12
+OWNER_PRIVATE_KEY=<your_multisig_private_key>
+JWT_SECRET_KEY=$(openssl rand -hex 32)
+ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+EOL
+```
+
+2. **Set Up PostgreSQL:**
+```bash
+sudo -u postgres psql -c "CREATE DATABASE sovrn_dex;"
+sudo -u postgres psql -c "CREATE USER sovrn WITH PASSWORD 'sovrn_secure_pass';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE sovrn_dex TO sovrn;"
+```
+
+3. **Run Services:**
+```bash
+# Start Redis
+redis-server
+
+# Start PostgreSQL
+sudo service postgresql start
+
+# Run the application
+uvicorn sovrn_dex:app --host 0.0.0.0 --port 8000
+```
+
+4. **Test Endpoints:**
+```bash
+# Register user
+curl -X POST http://localhost:8000/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "user@example.com", "password": "securepassword123"}'
+
+# Login
+curl -X POST http://localhost:8000/token \
+  -d "username=user@example.com&password=securepassword123"
+
+# Perform swap (use JWT from login)
+curl -X POST http://localhost:8000/swap \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"token_in": "0x...", "token_out": "0x...", "amount_in": 1.0, "min_amount_out": 0.95}'
+```
+
+**Key Features:**
+- Decentralized exchange with liquidity pools
+- Cross-border payments via multiple systems (CIPS, UPI, PIX, etc.)
+- BRICS Unit minting with Chainlink VRF randomness
+- On-chain governance with voting power based on token holdings
+- JWT-based authentication with MFA
+- Redis-based rate limiting
+- Prometheus metrics endpoint
+- Health monitoring system
+- PostgreSQL database for persistent storage
+
+
+
